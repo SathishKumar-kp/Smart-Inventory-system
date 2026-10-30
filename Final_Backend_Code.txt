@@ -1,0 +1,222 @@
+# This file contains a complete backend application.
+
+import sys
+import json
+import django
+from datetime import date, timedelta
+from django.conf import settings
+from django.core.management import execute_from_command_line
+from django.http import JsonResponse, HttpResponse
+from django.db import models, connection
+from django.urls import path, re_path, include
+from django.utils import timezone
+
+# --- 1. Settings Configuration ---
+# We configure Django settings here, in one place.
+# This is the minimum needed for a simple API.
+if not settings.configured:
+    settings.configure(
+        DEBUG=True,
+        ROOT_URLCONF=__name__,
+        SECRET_KEY='a-dummy-secret-key-for-this-prototype',
+
+        INSTALLED_APPS=[
+            # Core Django apps needed for the system to work
+            'django.contrib.auth',
+            'django.contrib.contenttypes',
+            'django.contrib.sessions',
+            # Our API libraries
+            'rest_framework',
+            'corsheaders',
+        ],
+
+        DATABASES={
+            'default': {
+                'ENGINE': 'django.db.backends.sqlite3',
+                'NAME': 'db.sqlite3',  # This will create a db.sqlite3 file
+            }
+        },
+
+        MIDDLEWARE=[
+            # Handles Cross-Origin Resource Sharing (CORS)
+            'corsheaders.middleware.CorsMiddleware',
+            # Manages user sessions
+            'django.contrib.sessions.middleware.SessionMiddleware',
+            # Core Django middleware
+            'django.middleware.common.CommonMiddleware',
+            'django.contrib.auth.middleware.AuthenticationMiddleware',
+        ],
+
+        # --- API (REST Framework) Settings ---
+        REST_FRAMEWORK={
+            # We explicitly tell the API *not* to use any login/permission
+            # system, as our prototype is open.
+            'DEFAULT_AUTHENTICATION_CLASSES': [],
+            'DEFAULT_PERMISSION_CLASSES': [],
+            'UNAUTHENTICATED_USER': None,
+        },
+
+        # --- CORS (Cross-Origin) Settings ---
+        # This tells our "kitchen" (backend) to accept "orders" (requests)
+        # from our "dining room" (frontend).
+        CORS_ALLOWED_ORIGINS=[
+            'http://localhost:5500',  # For the `python -m http.server`
+            'http://127.0.0.1:5500',  # For the `python -m http.server`
+            'null',  # For `file:///` requests (testing only)
+        ],
+    )
+
+# --- 2. Load Django ---
+# This command officially loads all the apps and settings.
+django.setup()
+
+
+# --- 3. Database Model (The "Blueprint") ---
+# Renamed from 'Product' to 'InventoryItem' to avoid library conflict
+class InventoryItem(models.Model):
+    # We create an 'api' app in memory to hold this model
+    class Meta:
+        app_label = 'api'
+        ordering = ['expiry_date']  # Always sort products by expiry date
+
+    id = models.AutoField(primary_key=True)
+    name = models.CharField(max_length=200)
+    barcode = models.CharField(max_length=100, unique=True)
+    expiry_date = models.DateField()
+    notified = models.BooleanField(default=False)
+
+    def __str__(self):
+        return self.name
+
+
+# --- 4. API Serializer (The "Translator") ---
+# Renamed to match the model
+from rest_framework import serializers
+
+
+class InventoryItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InventoryItem
+        fields = ['id', 'name', 'barcode', 'expiry_date', 'notified']
+
+
+# --- 5. API ViewSet (The "Brain" / Logic) ---
+# Renamed to match the model
+from rest_framework import viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
+
+
+class InventoryItemViewSet(viewsets.ModelViewSet):
+    queryset = InventoryItem.objects.all()
+    serializer_class = InventoryItemSerializer
+
+    # This creates a new "endpoint" or "menu item" for our API
+    # at: /api/products/expiring_for_notification/
+    @action(detail=False, methods=['get'])
+    def expiring_for_notification(self, request):
+        today = timezone.now().date()
+        three_days_from_now = today + timedelta(days=3)
+
+        # Find products that are...
+        # 1. Not expired (expiry_date >= today)
+        # 2. Expiring in the next 3 days (expiry_date <= three_days_from_now)
+        # 3. We have not already notified the user about (notified=False)
+        products = InventoryItem.objects.filter(
+            expiry_date__gte=today,
+            expiry_date__lte=three_days_from_now,
+            notified=False
+        )
+
+        # Mark them as "notified" in the database
+        # We use .all() to evaluate the queryset before updating
+        product_list = list(products)
+        products.update(notified=True)
+
+        # Send the list of newly expiring products back to the frontend
+        serializer = self.get_serializer(product_list, many=True)
+        return Response(serializer.data)
+
+    # This creates the endpoint /api/products/stats/
+    @action(detail=False, methods=['get'])
+    def stats(self, request):
+        today = timezone.now().date()
+        seven_days_from_now = today + timedelta(days=7)
+
+        total_products = InventoryItem.objects.count()
+
+        expiring_soon = InventoryItem.objects.filter(
+            expiry_date__gte=today,
+            expiry_date__lte=seven_days_from_now
+        ).count()
+
+        expired = InventoryItem.objects.filter(
+            expiry_date__lt=today
+        ).count()
+
+        return Response({
+            'total_products': total_products,
+            'expiring_soon': expiring_soon,
+            'expired': expired
+        })
+
+# --- 6. URLS (The "Menu") ---
+# This is the "menu" for our API. It tells Django which
+# "brain" (ViewSet) to use for which URL.
+from rest_framework.routers import DefaultRouter
+
+router = DefaultRouter()
+# The URL is still /api/products/, but it points to our new ViewSet
+router.register(r'products', InventoryItemViewSet, basename='product')
+
+# This is our main URL list
+urlpatterns = [
+    re_path(r'^api/', include(router.urls)),  # All API urls start with /api/
+]
+
+
+# --- 7. Management Commands (The "Power Switch") ---
+# This part handles running the server and database migrations.
+
+def create_db_table():
+    """
+    Manually creates the api_inventoryitem table if it doesn't exist.
+    This bypasses the migration system, which is unreliable in single-file apps.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS "api_inventoryitem" (
+                "id" integer NOT NULL PRIMARY KEY AUTOINCREMENT,
+                "name" varchar(200) NOT NULL,
+                "barcode" varchar(100) NOT NULL UNIQUE,
+                "expiry_date" date NOT NULL,
+                "notified" bool NOT NULL
+            );
+        """)
+        # We also create a unique index on the barcode to be safe
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS "api_inventoryitem_barcode_uniq" 
+            ON "api_inventoryitem" ("barcode");
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS "api_inventoryitem_expiry_date_idx" 
+            ON "api_inventoryitem" ("expiry_date");
+        """)
+
+
+def main():
+    # 1. First, manually create our database table
+    try:
+        create_db_table()
+    except Exception as e:
+        print(f"Error creating database table: {e}")
+        sys.exit(1)  # Exit if we can't create the table
+
+    # 2. Then, run the server.
+    # We pass all original commands (like 'runserver') along.
+    execute_from_command_line(sys.argv)
+
+
+if __name__ == '__main__':
+    main()
+
